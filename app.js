@@ -36,8 +36,38 @@ const route=()=>location.hash.slice(1)||'menu';
 const mine=()=>S.orders.find(o=>o.id===LS.r('bz_mine',null));
 const FAV=()=>LS.r('bz_fav',[]);
 
-/* ---------- data layer (shared db when available, else this device only) ---------- */
+/* ---------- data layer: Firebase (shared) -> Claude db -> this device only ---------- */
+let QUEUE=[],OWN=null,FULL=[],fbUnsubs=[],curDay=null;
+// Customers only ever see: the public queue (order numbers + status) and their own order.
+// Staff (logged in with email) see every order.
+function rebuild(){
+  S.orders=S.admin&&mode==='firebase'?FULL:[...QUEUE.filter(q=>!OWN||q.id!==OWN.id),...(OWN?[OWN]:[])];
+  refresh();
+}
+function listen(){
+  const F=window.FB;fbUnsubs.forEach(u=>u());fbUnsubs=[];
+  const err=e=>{console.error(e);S.fbErr=e.code||'error';refresh()};
+  curDay=dk(Date.now());
+  fbUnsubs.push(F.onSnapshot(F.query(F.collection(F.db,'queue'),F.where('day','==',curDay)),s=>{S.fbErr='';QUEUE=s.docs.map(d=>({...d.data(),id:d.id}));rebuild()},err));
+  fbUnsubs.push(F.onSnapshot(F.doc(F.db,'settings','menu'),s=>{S.sold=s.exists()?(s.data().sold||[]):[];if(route()==='menu')render()},err));
+  const id=LS.r('bz_mine',null);
+  if(S.admin){fbUnsubs.push(F.onSnapshot(F.collection(F.db,'orders'),s=>{FULL=s.docs.map(d=>({...d.data(),id:d.id}));rebuild()},err))}
+  else{FULL=[];if(id)fbUnsubs.push(F.onSnapshot(F.doc(F.db,'orders',id),s=>{OWN=s.exists()?{...s.data(),id:s.id}:null;rebuild()},err))}
+  rebuild();
+}
+async function startFirebase(){
+  mode='firebase';const F=window.FB;
+  F.onAuthStateChanged(F.auth,u=>{
+    if(!u){F.signInAnonymously(F.auth).catch(e=>{console.error(e);S.fbErr=e.code||'auth-error';render()});return}
+    S.admin=!u.isAnonymous; // password login = staff (the database rules decide what staff may really do)
+    listen();render();
+  });
+  setInterval(()=>{if(S.uid!==null&&dk(Date.now())!==curDay&&window.FB.auth.currentUser)listen()},60000);
+  S.uid='';
+}
 async function initData(){
+  const ok=await Promise.race([window.FBReady||Promise.resolve(false),new Promise(r=>setTimeout(()=>r(false),8000))]);
+  if(ok&&window.FB)return startFirebase();
   try{if(window.claude)dbc=await Promise.race([claude.use('db'),new Promise(r=>setTimeout(()=>r(null),4000))])}catch(e){}
   if(dbc){mode='shared';
     dbc.collection('orders').onSnapshot(s=>{S.orders=s.docs.map(d=>({...d.data(),id:d.id}));refresh()},()=>{});
@@ -47,12 +77,40 @@ async function initData(){
     load();setInterval(load,3000);addEventListener('storage',load);
   }
 }
-async function saveOrder(o){if(dbc)await dbc.doc('orders/'+o.id).set(o);else{S.orders.push(o);LS.w('bz_orders',S.orders)}}
+async function saveOrder(o){
+  if(mode==='firebase'){
+    const F=window.FB,day=dk(o.t),cref=F.doc(F.db,'counters',day);
+    o.day=day;o.uid=F.auth.currentUser.uid;
+    // numbered inside a transaction so two customers can never get the same number
+    await F.runTransaction(F.db,async tx=>{
+      const c=await tx.get(cref);o.n=(c.exists()?c.data().n:0)+1;
+      tx.set(cref,{n:o.n});
+      tx.set(F.doc(F.db,'orders',o.id),o);
+      tx.set(F.doc(F.db,'queue',o.id),{id:o.id,n:o.n,status:'new',t:o.t,day,uid:o.uid});
+    });
+  }else if(dbc)await dbc.doc('orders/'+o.id).set(o);
+  else{S.orders.push(o);LS.w('bz_orders',S.orders)}
+}
 async function patchOrder(id,p){
-  if(dbc)await dbc.doc('orders/'+id).update(p);
+  if(mode==='firebase'){
+    try{const F=window.FB,b=F.writeBatch(F.db);b.update(F.doc(F.db,'orders',id),p);if(p.status)b.update(F.doc(F.db,'queue',id),{status:p.status});await b.commit()}
+    catch(e){console.error(e);alert('Could not save that change ('+(e.code||'error')+').')}
+  }else if(dbc)await dbc.doc('orders/'+id).update(p);
   else{const o=S.orders.find(x=>x.id===id);Object.assign(o,p);LS.w('bz_orders',S.orders);refresh()}
 }
-async function setSold(list){S.sold=list;if(dbc)await dbc.doc('settings/menu').set({sold:list});else LS.w('bz_sold',list);render()}
+async function setSold(list){
+  S.sold=list;
+  try{
+    if(mode==='firebase'){const F=window.FB;await F.setDoc(F.doc(F.db,'settings','menu'),{sold:list})}
+    else if(dbc)await dbc.doc('settings/menu').set({sold:list});else LS.w('bz_sold',list);
+  }catch(e){console.error(e);alert('Could not save sold-out list ('+(e.code||'error')+').')}
+  render();
+}
+async function staffLogin(){
+  try{await window.FB.signInWithEmailAndPassword(window.FB.auth,$('#se').value.trim(),$('#sp').value);unlock()}
+  catch(e){alert('Login failed. Check the staff email and password.')}
+}
+function staffLogout(){S.admin=false;FULL=[];window.FB.signOut(window.FB.auth)}
 let lastStatus=null;
 let AC=null,lastN=null;const T0=document.title;
 function setTitle(){const m=mine();document.title=!m||m.status==='done'||m.status==='void'?T0:m.status==='ready'?'🔔 #'+pad(m.n)+' READY':'#'+pad(m.n)+' · '+label(m.status)}
@@ -67,6 +125,7 @@ function ping(m){
 }
 function refresh(){
   const m=mine();
+  if(m&&!window.__resc){window.__resc=1;if(!location.hash&&(m.status!=='done'||!m.rating))location.hash='order'}
   if(m&&lastStatus&&lastStatus!==m.status&&m.status==='ready')ping(m);
   lastStatus=m?m.status:null;
   setTitle();
@@ -118,7 +177,7 @@ function vMenu(){
   <div class="cats">${cats.map(c=>`<button class="cat ${c===S.cat&&!S.q&&!S.fav?'on':''}" onclick="S.cat='${c}';S.q='';S.fav=false;render()"><i></i>${c}</button>`).join('')}</div>`+
   (act?`<div class="card" onclick="location.hash='order'" style="cursor:pointer;margin-top:0"><div class="row"><span>Your order <b>#${pad(m.n)}</b> · ${label(m.status)}</span><b>View →</b></div></div>`:'')+
   servingHTML()+`<div class="grid" id="grid">${gridHTML()}</div>`+footer()+
-  (mode==='local'?'<div class="note">Demo mode: orders stay on this device</div>':'')+nav();
+  (mode==='local'?'<div class="note">Demo mode: orders stay on this device</div>':'')+(S.fbErr?'<div class="note">Connection problem ('+esc(S.fbErr)+'). Please tell the staff.</div>':'')+nav();
 }
 const ADDONS=[];
 function openItem(id){const it=MENU.find(i=>i.id===id);window.cur={it,size:0,sugar:1,ice:0,q:1,add:[],note:''};drawSheet();$('#sheet').classList.add('on')}
@@ -174,8 +233,8 @@ async function place(){
   const day=new Date().toDateString(),today=S.orders.filter(o=>new Date(o.t).toDateString()===day);
   const n=today.reduce((a,o)=>Math.max(a,o.n),0)+1;
   const o={id:'o'+Date.now(),n,name,items:S.cart.map(i=>({n:i.n,opt:i.opt,q:i.q,p:i.p})),total:cartTotal(),pay:S.pay,paid:false,status:'new',code:mkCode(),table:($('#tb').value||'').trim(),email:em,t:Date.now()};
-  try{await saveOrder(o)}catch(e){alert('Could not place the order. Please tell the staff.');return}
-  LS.w('bz_mine',o.id);S.cart=[];location.hash='order';
+  try{await saveOrder(o)}catch(e){console.error(e);alert('Could not place the order. Please tell the staff.');return}
+  LS.w('bz_mine',o.id);S.cart=[];if(mode==='firebase'){OWN=o;listen()}location.hash='order';
 }
 const pad=n=>String(n).padStart(3,'0');
 const label=s=>(STEPS.find(x=>x[0]===s)||['','Cancelled'])[1];
@@ -203,7 +262,9 @@ function review(m){
 async function sendReview(id){if(!window.rt)return alert('Tap a star first');await patchOrder(id,{rating:rt,comment:($('#cm').value||'').trim()});window.rt=0}
 
 /* ---------- admin ---------- */
-const ago=t=>{const m=Math.round((Date.now()-t)/60000);return m<1?'just now':m+' min ago'};
+const ago=t=>{const m=Math.round((Date.now()-t)/60000);return m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago'};
+const dk=t=>{const d=new Date(t);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')};
+const nice=d=>new Date(d+'T00:00').toLocaleDateString('en-PH',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
 function board(active){
   const cols=[['new','🆕 New orders'],['preparing','🥤 Preparing'],['ready','🔔 Ready for pickup']];
   const act={new:['Start preparing','preparing'],preparing:['Mark READY · pings customer','ready'],ready:['Picked up ✓','done']},back={preparing:'new',ready:'preparing'};
@@ -215,16 +276,18 @@ function board(active){
     <div class="row">${back[st]?`<button class="chip" onclick="patchOrder('${o.id}',{status:'${back[st]}'})">← Back</button>`:'<span></span>'}<button class="chip" onclick="if(confirm('Void this order?'))patchOrder('${o.id}',{status:'void'})">Void</button></div></div>`).join('')||'<div class="card c sub">None</div>')}).join('');
 }
 function vAdmin(){
+  if(!S.admin&&mode==='firebase')return hdr('Staff')+`<div class="card"><b>Staff login</b><input id="se" type="email" autocomplete="username" placeholder="Staff email" style="margin:8px 0"><input id="sp" type="password" autocomplete="current-password" placeholder="Password" style="margin:0 0 8px" onkeydown="if(event.key==='Enter')staffLogin()"><button class="btn" onclick="staffLogin()">Log in</button></div>`;
   if(!S.admin)return hdr('Staff')+`<div class="card"><b>Staff PIN</b><input id="pin" type="password" inputmode="numeric" style="margin:8px 0"><button class="btn" onclick="if($('#pin').value===PIN){S.admin=true;unlock();render()}else alert('Wrong PIN')">Enter</button></div>`;
-  const O=[...S.orders].sort((a,b)=>b.n-a.n),active=O.filter(o=>o.status!=='done'&&o.status!=='void').reverse();
-  const paid=O.filter(o=>o.status!=='void'),rev=paid.reduce((a,o)=>a+o.total,0),rv=O.filter(o=>o.rating);
+  const O=[...S.orders].sort((a,b)=>b.t-a.t),active=O.filter(o=>o.status!=='done'&&o.status!=='void').reverse();
+  const day=S.day||dk(Date.now()),isToday=day===dk(Date.now()),D=O.filter(o=>dk(o.t)===day);
+  const paid=D.filter(o=>o.status!=='void'),rev=paid.reduce((a,o)=>a+o.total,0),rv=D.filter(o=>o.rating);
   const avg=rv.length?(rv.reduce((a,o)=>a+o.rating,0)/rv.length).toFixed(1):'–';
   const cnt={};paid.forEach(o=>o.items.forEach(i=>cnt[i.n]=(cnt[i.n]||0)+i.q));
   const topI=Object.entries(cnt).sort((a,b)=>b[1]-a[1]).slice(0,3).map(x=>x[0]+' ('+x[1]+')').join(', ')||'–';
   const hrs={};paid.forEach(o=>{const h=new Date(o.t).getHours();hrs[h]=(hrs[h]||0)+1});
   const peak=Object.entries(hrs).sort((a,b)=>b[1]-a[1])[0];
   const by=p=>paid.filter(o=>o.pay===p).length;
-  return hdr('Staff')+`<div class="card"><b>Today so far</b><div class="row"><span>Revenue</span><b>${peso(rev)}</b></div><div class="row"><span>Orders · avg</span><b>${paid.length} · ${peso(paid.length?Math.round(rev/paid.length):0)}</b></div>
+  return hdr('Staff',mode==='firebase'?'<button class="chip" onclick="staffLogout()">Log out</button>':'')+`<div class="card"><div class="row" style="padding-top:0"><b>${isToday?'Today so far':'Sales for '+nice(day)}</b><span><input type="date" id="dy" value="${day}" onchange="S.day=this.value;this.blur();render()" style="width:auto;padding:6px 8px">${isToday?'':` <button class="chip" onclick="S.day='';render()">Today</button>`}</span></div><div class="sub" style="margin-bottom:6px">Totals start fresh each new date. Pick another date to look at past days.</div><div class="row"><span>Revenue</span><b>${peso(rev)}</b></div><div class="row"><span>Orders · avg</span><b>${paid.length} · ${peso(paid.length?Math.round(rev/paid.length):0)}</b></div>
    <div class="row"><span>Cash / GCash / Maya</span><b>${by('Cash')} / ${by('GCash')} / ${by('Maya')}</b></div><div class="row"><span>Rating</span><b>${avg}★ (${rv.length})</b></div>
    <div class="row"><span>Peak hour</span><b>${peak?peak[0]+':00 ('+peak[1]+' orders)':'–'}</b></div><div class="sub">Top: ${esc(topI)}</div></div>
   ${board(active)}<div class="sec"><h2>Sold-out toggles</h2></div><div class="card"><div class="chips">${MENU.map(i=>`<button class="chip ${S.sold.includes(i.id)?'on':''}" onclick="setSold(S.sold.includes('${i.id}')?S.sold.filter(x=>x!=='${i.id}'):[...S.sold,'${i.id}'])">${i.n}</button>`).join('')}</div><div class="sub">Highlighted = sold out</div></div>
