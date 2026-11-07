@@ -28,6 +28,7 @@ const I={
  bag:'<svg viewBox="0 0 24 24"><path d="M5 3h14v18l-3-2-2 2-2-2-2 2-2-2-3 2z"/><path d="M8 8h8M8 12h8"/></svg>',
  cart:'<svg viewBox="0 0 24 24"><path d="M3 4h2l2.5 11h10L20 7H6.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="17" cy="19" r="1.5"/></svg>'};
 let dbc=null,mode='local';
+const DEMO=location.protocol==='file:'||/claude/.test(location.hostname)||!location.hostname; // demo mode is only OK in previews
 const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const peso=n=>'₱'+n.toLocaleString();
@@ -65,15 +66,25 @@ async function startFirebase(){
   setInterval(()=>{if(S.uid!==null&&dk(Date.now())!==curDay&&window.FB.auth.currentUser)listen()},60000);
   S.uid='';
 }
+let hiddenAt=0;
+const relisten=()=>{if(mode==='firebase'&&window.FB&&window.FB.auth.currentUser)listen()};
+document.addEventListener('visibilitychange',()=>{ // phones pause the live connection when the screen sleeps: reconnect on return
+  if(document.hidden){hiddenAt=Date.now();return}
+  if(hiddenAt&&Date.now()-hiddenAt>15000)relisten();
+});
+addEventListener('online',relisten);
+addEventListener('pageshow',e=>{if(e.persisted)relisten()});
 async function initData(){
   const ok=await Promise.race([window.FBReady||Promise.resolve(false),new Promise(r=>setTimeout(()=>r(false),8000))]);
   if(ok&&window.FB)return startFirebase();
+  // slow venue signal? don't stay in demo mode forever: connect as soon as Firebase finishes loading
+  if(window.FBReady)window.FBReady.then(g=>{if(g&&window.FB&&mode!=='firebase')startFirebase()});
   try{if(window.claude)dbc=await Promise.race([claude.use('db'),new Promise(r=>setTimeout(()=>r(null),4000))])}catch(e){}
   if(dbc){mode='shared';
     dbc.collection('orders').onSnapshot(s=>{S.orders=s.docs.map(d=>({...d.data(),id:d.id}));refresh()},()=>{});
     dbc.doc('settings/menu').onSnapshot(s=>{S.sold=s.exists?(s.data().sold||[]):[];if(route()==='menu')render()},()=>{});
   }else{
-    const load=()=>{S.orders=LS.r('bz_orders',[]);S.sold=LS.r('bz_sold',[]);refresh()};
+    const load=()=>{if(mode==='firebase')return;S.orders=LS.r('bz_orders',[]);S.sold=LS.r('bz_sold',[]);refresh()};
     load();setInterval(load,3000);addEventListener('storage',load);
   }
 }
@@ -225,6 +236,7 @@ function copyNum(m,b){try{navigator.clipboard.writeText(PAY[m].num.replace(/\s/g
 function keepName(){const e=$('#nm');if(e)LS.w('bz_name',e.value);const t=$('#tb');if(t)S.tb=t.value;const em=$('#em');if(em)LS.w('bz_email',em.value)}
 const mkCode=()=>{const A='ABCDEFGHJKLMNPQRSTUVWXYZ',r=n=>Array.from({length:n},()=>A[Math.random()*A.length|0]).join('');return r(3)+'-'+r(6)};
 async function place(){
+  if(mode==='local'&&!DEMO){alert('Not connected to the shop yet. Check your signal and try again in a moment.');return}
   unlock();try{window.Notification&&Notification.permission==='default'&&Notification.requestPermission()}catch(e){}
   const name=($('#nm').value||'').trim()||'Guest';LS.w('bz_name',name);
   const em=EMAIL_ENABLED&&$('#em')?$('#em').value.trim():'';
@@ -245,14 +257,14 @@ function vOrder(){
   const live=S.orders.filter(o=>o.status==='new'||o.status==='preparing').sort((a,b)=>a.n-b.n);
   const serving=(live.find(o=>o.status==='preparing')||live[0]),ahead=live.filter(o=>o.n<m.n).length;
   const idx=STEPS.findIndex(s=>s[0]===m.status);
-  return hdr('Order status')+(m.status==='ready'||m.status==='done'?'':`<div class="alertbox"><b>⚠️ Want to know when your order is ready?</b>Keep this page open, or come back to this tab to check your order status. You may not get a ping if you close the page.</div>`)+`<div class="card"><i class="sph a"></i><i class="sph b"></i><h2 class="c" style="margin:4px 0 10px">${m.status==='ready'?'Come and get it!':m.status==='done'?'All done.':m.paid?'Paid. We’re on it.':'Order in. We’re on it.'}</h2><div class="sub c">Order number</div><div class="big">#${pad(m.n)}</div><div class="code">${esc(m.code||'')}</div>${m.table?`<div class="c sub">We’ll bring it to ${esc(m.table)}</div>`:''}
+  return hdr('Order status')+(m.status==='ready'||m.status==='done'?'':`<div class="alertbox"><b>⚠️ Want to know when your order is ready?</b>Keep this page open, or come back to this tab to check your order status. You may not get a ping if you close the page.</div>`)+(mode==='local'&&!DEMO?`<div class="alertbox" style="background:#fde2e0;border-color:#f3b4af;color:#7a1f17"><b>Not connected</b>Status won’t update until the connection is back. Check your signal, then tap Refresh status.</div>`:'')+(S.fbErr?`<div class="alertbox" style="background:#fde2e0;border-color:#f3b4af;color:#7a1f17"><b>Connection problem (${esc(S.fbErr)})</b>Tap Refresh status below, or tell the staff.</div>`:'')+`<div class="card"><i class="sph a"></i><i class="sph b"></i><h2 class="c" style="margin:4px 0 10px">${m.status==='ready'?'Come and get it!':m.status==='done'?'All done.':m.paid?'Paid. We’re on it.':'Order in. We’re on it.'}</h2><div class="sub c">Order number</div><div class="big">#${pad(m.n)}</div><div class="code">${esc(m.code||'')}</div>${m.table?`<div class="c sub">We’ll bring it to ${esc(m.table)}</div>`:''}
    <div class="steps">${STEPS.map((s,i)=>`<div class="st ${i<=idx?'on':''}"><i>${i<idx?'✓':i+1}</i>${s[1]}</div>`).join('')}</div>
    <div class="c" style="margin-top:12px">${m.status==='ready'?'<b>Your drink is ready! Head to the counter.</b>':m.status==='done'?'Enjoy your order!':m.status==='preparing'?'We’re making your order now.':ahead?`${ahead} order${ahead>1?'s':''} ahead of you`:'You’re next!'}</div>
    ${serving&&m.status!=='done'?`<div class="sub c" style="margin-top:6px">Now serving #${pad(serving.n)}</div>`:''}</div>
   ${m.pay!=='Cash'&&!m.paid&&m.status!=='done'?`<div class="card"><b>Pay with ${m.pay}</b>${payHTML(m.pay,m.total)}</div>`:''}
   <div class="card"><b>Order for ${esc(m.name)}</b>${m.items.map(i=>`<div class="row"><span>${i.q}× ${esc(i.n)}<div class="sub">${esc(i.opt)}</div></span><span>${peso(i.p*i.q)}</span></div>`).join('')}
    <div class="dash"></div><div class="row"><b>Total · ${m.pay}</b><b>${peso(m.total)}</b></div></div>`+
-  (m.status==='done'?review(m):`<div class="card"><button class="btn alt" onclick="location.hash='menu'">Browse the menu while you wait</button><div class="sub c" style="margin-top:8px">${m.email?'We’ll also email '+esc(m.email)+' when your order is ready.':''}</div></div>`)+footer();
+  (m.status==='done'?review(m):`<div class="card"><button class="btn alt" style="margin-bottom:8px" onclick="relisten()">↻ Refresh status</button><button class="btn alt" onclick="location.hash='menu'">Browse the menu while you wait</button><div class="sub c" style="margin-top:8px">${m.email?'We’ll also email '+esc(m.email)+' when your order is ready.':''}</div></div>`)+footer();
 }
 function review(m){
   if(m.rating)return `<div class="card c"><b>Thanks for the ${m.rating}★ review!</b><br><br><button class="btn" onclick="LS.w('bz_mine',null);location.hash='menu'">Order again</button></div>`;
