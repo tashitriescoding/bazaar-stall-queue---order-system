@@ -13,9 +13,11 @@ try{
   const [{initializeApp},fs,au]=await Promise.all([
     import(B+'firebase-app.js'),import(B+'firebase-firestore.js'),import(B+'firebase-auth.js')]);
   const app=initializeApp(firebaseConfig);
+  // auto-switch to a more tolerant connection mode on networks that block live streaming
+  let db;try{db=fs.initializeFirestore(app,{experimentalAutoDetectLongPolling:true})}catch(e){db=fs.getFirestore(app)}
   window.FB={
-    db:fs.getFirestore(app),auth:au.getAuth(app),
-    collection:fs.collection,doc:fs.doc,setDoc:fs.setDoc,updateDoc:fs.updateDoc,onSnapshot:fs.onSnapshot,
+    db,auth:au.getAuth(app),
+    collection:fs.collection,doc:fs.doc,getDoc:fs.getDoc,setDoc:fs.setDoc,updateDoc:fs.updateDoc,onSnapshot:fs.onSnapshot,
     runTransaction:fs.runTransaction,writeBatch:fs.writeBatch,query:fs.query,where:fs.where,
     signInAnonymously:au.signInAnonymously,signInWithEmailAndPassword:au.signInWithEmailAndPassword,
     signOut:au.signOut,onAuthStateChanged:au.onAuthStateChanged};
