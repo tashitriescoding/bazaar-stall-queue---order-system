@@ -66,14 +66,33 @@ async function startFirebase(){
   setInterval(()=>{if(S.uid!==null&&dk(Date.now())!==curDay&&window.FB.auth.currentUser)listen()},60000);
   S.uid='';
 }
-let hiddenAt=0;
-const relisten=()=>{if(mode==='firebase'&&window.FB&&window.FB.auth.currentUser)listen()};
-document.addEventListener('visibilitychange',()=>{ // phones pause the live connection when the screen sleeps: reconnect on return
-  if(document.hidden){hiddenAt=Date.now();return}
-  if(hiddenAt&&Date.now()-hiddenAt>15000)relisten();
-});
-addEventListener('online',relisten);
-addEventListener('pageshow',e=>{if(e.persisted)relisten()});
+let lastRelisten=0;
+const relisten=()=>{if(mode==='firebase'&&window.FB&&window.FB.auth.currentUser&&Date.now()-lastRelisten>1500){lastRelisten=Date.now();listen()}};
+// Safety net: if the live connection silently stalls (weak venue signal, phone woke up), re-read the
+// customer's own order directly from the server. One small read every 15s, only while their order is active.
+async function pollOwn(){
+  if(mode!=='firebase'||!window.FB||!window.FB.getDoc||S.admin)return;
+  const id=LS.r('bz_mine',null),m=mine();
+  if(!id||(m&&(m.status==='done'||m.status==='void')))return;
+  try{
+    const s=await window.FB.getDoc(window.FB.doc(window.FB.db,'orders',id));
+    if(s.exists()){const d={...s.data(),id:s.id};if(!OWN||OWN.status!==d.status||OWN.paid!==d.paid||OWN.rating!==d.rating){OWN=d;rebuild()}}
+  }catch(e){}
+}
+setInterval(pollOwn,15000);
+// Keep the phone's screen on while an order is active, so the page keeps running and listening.
+let wl=null;
+async function keepAwake(){
+  const m=mine(),active=m&&m.status!=='done'&&m.status!=='void';
+  if(!active){if(wl){try{wl.release()}catch(e){}wl=null}return}
+  try{if('wakeLock' in navigator&&!wl&&!document.hidden){wl=await navigator.wakeLock.request('screen');wl.addEventListener('release',()=>{wl=null})}}catch(e){}
+}
+// Wake-up triggers: the moment the customer returns to the tab or regains signal, resync immediately.
+const wake=()=>{relisten();pollOwn();keepAwake()};
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)wake()});
+addEventListener('focus',wake);
+addEventListener('online',wake);
+addEventListener('pageshow',wake);
 async function initData(){
   const ok=await Promise.race([window.FBReady||Promise.resolve(false),new Promise(r=>setTimeout(()=>r(false),8000))]);
   if(ok&&window.FB)return startFirebase();
@@ -129,7 +148,11 @@ function unlock(){try{AC=AC||new(window.AudioContext||window.webkitAudioContext)
 function beep(n=3){try{unlock();for(let i=0;i<n;i++){const o=AC.createOscillator(),g=AC.createGain();o.connect(g);g.connect(AC.destination);o.frequency.value=i%2?880:1175;g.gain.value=.25;const t=AC.currentTime+i*.28;o.start(t);o.stop(t+.2)}}catch(e){}}
 function ping(m){
   beep();try{navigator.vibrate&&navigator.vibrate([300,150,300,150,300])}catch(e){}
-  try{if(window.Notification&&Notification.permission==='granted')new Notification(BRAND.name,{body:'Order #'+pad(m.n)+' is ready! Please pick it up.'})}catch(e){}
+  try{if(window.Notification&&Notification.permission==='granted'){
+    const body='Order #'+pad(m.n)+' is ready! Please pick it up.',plain=()=>{try{new Notification(BRAND.name,{body})}catch(e){}};
+    if(navigator.serviceWorker)navigator.serviceWorker.getRegistration().then(r=>r?r.showNotification(BRAND.name,{body,vibrate:[300,150,300,150,300],tag:'order-ready',renotify:true,requireInteraction:true}):plain()).catch(plain);
+    else plain();
+  }}catch(e){}
   const t=document.createElement('div');t.id='toast';
   t.innerHTML='<b>🔔 Order #'+pad(m.n)+' is ready!</b><div>Please head to the counter.</div><button class="chip" onclick="this.parentNode.remove()">Got it</button>';
   document.body.appendChild(t);setTitle();
@@ -143,6 +166,7 @@ function refresh(){
   if(S.admin&&lastN!==null&&S.orders.length>lastN)beep(2);
   lastN=S.orders.length;
   updServing();
+  keepAwake();
   const typing=['TEXTAREA','INPUT'].includes((document.activeElement||{}).tagName);
   if(route()!=='menu'&&route()!=='cart'&&!typing&&!(route()==='admin'&&!S.admin))render();
 }
@@ -246,7 +270,7 @@ async function place(){
   const n=today.reduce((a,o)=>Math.max(a,o.n),0)+1;
   const o={id:'o'+Date.now(),n,name,items:S.cart.map(i=>({n:i.n,opt:i.opt,q:i.q,p:i.p})),total:cartTotal(),pay:S.pay,paid:false,status:'new',code:mkCode(),table:($('#tb').value||'').trim(),email:em,t:Date.now()};
   try{await saveOrder(o)}catch(e){console.error(e);alert('Could not place the order. Please tell the staff.');return}
-  LS.w('bz_mine',o.id);S.cart=[];if(mode==='firebase'){OWN=o;listen()}location.hash='order';
+  LS.w('bz_mine',o.id);S.cart=[];if(mode==='firebase'){OWN=o;listen()}location.hash='order';keepAwake();
 }
 const pad=n=>String(n).padStart(3,'0');
 const label=s=>(STEPS.find(x=>x[0]===s)||['','Cancelled'])[1];
@@ -320,3 +344,4 @@ addEventListener('hashchange',()=>{render();scrollTo(0,0)});
   else if(!location.hash&&m&&m.status==='done'&&!m.rating)location.hash='order';
   render();
 })();
+if('serviceWorker' in navigator)addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
