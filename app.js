@@ -1,5 +1,7 @@
 const BRAND={name:'Brew Bazaar',tag:'Matcha and hojicha, made to order',links:[['Instagram','https://instagram.com/'],['Facebook','https://facebook.com/'],['TikTok','https://tiktok.com/']]};
 const PIN='1234'; // change before opening day
+const APP_V=3; // bump this together with version.json so open pages reload onto new code
+const FB_PROJECT='bazaar-stall-order-queue',FB_KEY='AIzaSyBcNT7OHOW7-5iZ06bZJp31_BWazW-av4g';
 // Payment details shown when a customer picks GCash or Maya. Edit these, then upload your QR images
 // (qr-gcash.png and qr-maya.png) next to index.html.
 const PAY={
@@ -42,7 +44,14 @@ let QUEUE=[],OWN=null,FULL=[],fbUnsubs=[],curDay=null;
 // Customers only ever see: the public queue (order numbers + status) and their own order.
 // Staff (logged in with email) see every order.
 function rebuild(){
-  S.orders=S.admin&&mode==='firebase'?FULL:[...QUEUE.filter(q=>!OWN||q.id!==OWN.id),...(OWN?[OWN]:[])];
+  // The customer's order status arrives on two independent live feeds (their own order + the public queue).
+  // If one stalls, the other still carries the newest status, so use whichever is further along.
+  let own=OWN;
+  if(own){
+    const q=QUEUE.find(x=>x.id===own.id),rk=s=>s==='void'?99:STEPS.findIndex(x=>x[0]===s);
+    if(q&&q.status&&rk(q.status)>rk(own.status))own={...own,status:q.status};
+  }
+  S.orders=S.admin&&mode==='firebase'?FULL:[...QUEUE.filter(q=>!own||q.id!==own.id),...(own?[own]:[])];
   refresh();
 }
 function listen(){
@@ -53,7 +62,7 @@ function listen(){
   fbUnsubs.push(F.onSnapshot(F.doc(F.db,'settings','menu'),s=>{S.sold=s.exists()?(s.data().sold||[]):[];if(route()==='menu')render()},err));
   const id=LS.r('bz_mine',null);
   if(S.admin){fbUnsubs.push(F.onSnapshot(F.collection(F.db,'orders'),s=>{S.ordErr='';FULL=s.docs.map(d=>({...d.data(),id:d.id}));rebuild()},e=>{console.error(e);S.ordErr=e.code||'error';rebuild()}))}
-  else{FULL=[];if(id)fbUnsubs.push(F.onSnapshot(F.doc(F.db,'orders',id),s=>{OWN=s.exists()?{...s.data(),id:s.id}:null;rebuild()},err))}
+  else{FULL=[];if(id)fbUnsubs.push(F.onSnapshot(F.doc(F.db,'orders',id),s=>{S.ownErr='';OWN=s.exists()?{...s.data(),id:s.id}:null;rebuild()},e=>{console.error(e);S.ownErr=e.code||'error';rebuild()}))}
   rebuild();
 }
 async function startFirebase(){
@@ -70,16 +79,34 @@ let lastRelisten=0;
 const relisten=()=>{if(mode==='firebase'&&window.FB&&window.FB.auth.currentUser&&Date.now()-lastRelisten>1500){lastRelisten=Date.now();listen()}};
 // Safety net: if the live connection silently stalls (weak venue signal, phone woke up), re-read the
 // customer's own order directly from the server. One small read every 15s, only while their order is active.
+const lcText=()=>S.lc?'Auto-updating · last checked '+new Date(S.lc).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'Auto-updating';
+function stamp(){S.lc=Date.now();const e=document.getElementById('lc');if(e)e.textContent=lcText()}
+// Backup that does NOT use the live connection: a plain web request for just this order's status.
+// Works on any phone/browser even when the live feed is frozen or blocked.
+async function pollRest(){
+  if(mode!=='firebase')return;
+  const id=LS.r('bz_mine',null),m=mine();
+  if(!id||S.admin||(m&&(m.status==='done'||m.status==='void')))return;
+  try{
+    const r=await fetch('https://firestore.googleapis.com/v1/projects/'+FB_PROJECT+'/databases/(default)/documents/queue/'+encodeURIComponent(id)+'?key='+FB_KEY,{cache:'no-store'});
+    if(!r.ok)return;
+    const st=((await r.json()).fields||{}).status;
+    const s=st&&st.stringValue;
+    stamp();
+    if(s&&OWN&&OWN.id===id&&OWN.status!==s){OWN={...OWN,status:s};rebuild();pollOwn()}
+  }catch(e){}
+}
 async function pollOwn(){
   if(mode!=='firebase'||!window.FB||!window.FB.getDoc||S.admin)return;
   const id=LS.r('bz_mine',null),m=mine();
   if(!id||(m&&(m.status==='done'||m.status==='void')))return;
   try{
     const s=await window.FB.getDoc(window.FB.doc(window.FB.db,'orders',id));
+    stamp();
     if(s.exists()){const d={...s.data(),id:s.id};if(!OWN||OWN.status!==d.status||OWN.paid!==d.paid||OWN.rating!==d.rating){OWN=d;rebuild()}}
   }catch(e){}
 }
-setInterval(pollOwn,15000);
+setInterval(()=>{pollRest();pollOwn()},8000);
 // Keep the phone's screen on while an order is active, so the page keeps running and listening.
 let wl=null;
 async function keepAwake(){
@@ -88,7 +115,7 @@ async function keepAwake(){
   try{if('wakeLock' in navigator&&!wl&&!document.hidden){wl=await navigator.wakeLock.request('screen');wl.addEventListener('release',()=>{wl=null})}}catch(e){}
 }
 // Wake-up triggers: the moment the customer returns to the tab or regains signal, resync immediately.
-const wake=()=>{relisten();pollOwn();keepAwake()};
+const wake=()=>{relisten();pollRest();pollOwn();keepAwake()};
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)wake()});
 addEventListener('focus',wake);
 addEventListener('online',wake);
@@ -281,14 +308,14 @@ function vOrder(){
   const live=S.orders.filter(o=>o.status==='new'||o.status==='preparing').sort((a,b)=>a.n-b.n);
   const serving=(live.find(o=>o.status==='preparing')||live[0]),ahead=live.filter(o=>o.n<m.n).length;
   const idx=STEPS.findIndex(s=>s[0]===m.status);
-  return hdr('Order status')+(m.status==='ready'||m.status==='done'?'':`<div class="alertbox"><b>⚠️ Want to know when your order is ready?</b>Keep this page open, or come back to this tab to check your order status. You can also refresh the page (or tap Refresh status below) to check where your order is. You may not get a ping if you close the page.</div>`)+(mode==='local'&&!DEMO?`<div class="alertbox" style="background:#fde2e0;border-color:#f3b4af;color:#7a1f17"><b>Not connected</b>Status won’t update until the connection is back. Check your signal, then tap Refresh status.</div>`:'')+(S.fbErr?`<div class="alertbox" style="background:#fde2e0;border-color:#f3b4af;color:#7a1f17"><b>Connection problem (${esc(S.fbErr)})</b>Tap Refresh status below, or tell the staff.</div>`:'')+`<div class="card"><i class="sph a"></i><i class="sph b"></i><h2 class="c" style="margin:4px 0 10px">${m.status==='ready'?'Come and get it!':m.status==='done'?'All done.':m.paid?'Paid. We’re on it.':'Order in. We’re on it.'}</h2><div class="sub c">Order number</div><div class="big">#${pad(m.n)}</div><div class="code">${esc(m.code||'')}</div>${m.table?`<div class="c sub">We’ll bring it to ${esc(m.table)}</div>`:''}
+  return hdr('Order status')+(m.status==='ready'||m.status==='done'?'':`<div class="alertbox"><b>⚠️ Want to know when your order is ready?</b>Keep this page open, or come back to this tab to check your order status. You can also refresh the page (or tap Refresh status below) to check where your order is. You may not get a ping if you close the page.</div>`)+(mode==='local'&&!DEMO?`<div class="alertbox" style="background:#fde2e0;border-color:#f3b4af;color:#7a1f17"><b>Not connected</b>Status won’t update until the connection is back. Check your signal, then tap Refresh status.</div>`:'')+((S.fbErr||S.ownErr)?`<div class="alertbox" style="background:#fde2e0;border-color:#f3b4af;color:#7a1f17"><b>Connection problem (${esc(S.fbErr||S.ownErr)})</b>Tap Refresh status below, or tell the staff.</div>`:'')+`<div class="card"><i class="sph a"></i><i class="sph b"></i><h2 class="c" style="margin:4px 0 10px">${m.status==='ready'?'Come and get it!':m.status==='done'?'All done.':m.paid?'Paid. We’re on it.':'Order in. We’re on it.'}</h2><div class="sub c">Order number</div><div class="big">#${pad(m.n)}</div><div class="code">${esc(m.code||'')}</div>${m.table?`<div class="c sub">We’ll bring it to ${esc(m.table)}</div>`:''}
    <div class="steps">${STEPS.map((s,i)=>`<div class="st ${i<=idx?'on':''}"><i>${i<idx?'✓':i+1}</i>${s[1]}</div>`).join('')}</div>
    <div class="c" style="margin-top:12px">${m.status==='ready'?'<b>Your drink is ready! Head to the counter.</b>':m.status==='done'?'Enjoy your order!':m.status==='preparing'?'We’re making your order now.':ahead?`${ahead} order${ahead>1?'s':''} ahead of you`:'You’re next!'}</div>
    ${serving&&m.status!=='done'?`<div class="sub c" style="margin-top:6px">Now serving #${pad(serving.n)}</div>`:''}</div>
   ${m.pay!=='Cash'&&!m.paid&&m.status!=='done'?`<div class="card"><b>Pay with ${m.pay}</b>${payHTML(m.pay,m.total)}</div>`:''}
   <div class="card"><b>Order for ${esc(m.name)}</b>${m.items.map(i=>`<div class="row"><span>${i.q}× ${esc(i.n)}<div class="sub">${esc(i.opt)}</div></span><span>${peso(i.p*i.q)}</span></div>`).join('')}
    <div class="dash"></div><div class="row"><b>Total · ${m.pay}</b><b>${peso(m.total)}</b></div></div>`+
-  (m.status==='done'?review(m):`<div class="card"><button class="btn alt" style="margin-bottom:8px" onclick="relisten()">↻ Refresh status</button><button class="btn alt" onclick="location.hash='menu'">Browse the menu while you wait</button><div class="sub c" style="margin-top:8px">${m.email?'We’ll also email '+esc(m.email)+' when your order is ready.':''}</div></div>`)+footer();
+  (m.status==='done'?review(m):`<div class="card"><button class="btn alt" style="margin-bottom:8px" onclick="relisten()">↻ Refresh status</button><button class="btn alt" onclick="location.hash='menu'">Browse the menu while you wait</button><div class="sub c" id="lc" style="margin-top:8px">${lcText()}</div><div class="sub c" style="margin-top:4px">${m.email?'We’ll also email '+esc(m.email)+' when your order is ready.':''}</div></div>`)+footer();
 }
 function review(m){
   if(m.rating)return `<div class="card c"><b>Thanks for the ${m.rating}★ review!</b><br><br><button class="btn" onclick="LS.w('bz_mine',null);location.hash='menu'">Order again</button></div>`;
@@ -345,3 +372,7 @@ addEventListener('hashchange',()=>{render();scrollTo(0,0)});
   render();
 })();
 if('serviceWorker' in navigator)addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
+// Open pages pick up new versions by themselves (skips if the customer has items in the cart or is typing)
+setInterval(()=>{fetch('version.json?t='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(j=>{
+  const typing=['TEXTAREA','INPUT'].includes((document.activeElement||{}).tagName);
+  if(j&&j.v!==APP_V&&!S.cart.length&&!typing)location.reload()}).catch(()=>{})},60000);
