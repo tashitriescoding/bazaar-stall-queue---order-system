@@ -1,6 +1,6 @@
 const BRAND={name:'Brew Bazaar',tag:'Matcha and hojicha, made to order',links:[['Instagram','https://instagram.com/'],['Facebook','https://facebook.com/'],['TikTok','https://tiktok.com/']]};
 const PIN='1234'; // change before opening day
-const APP_V=4; // bump this together with version.json so open pages reload onto new code
+const APP_V=5; // bump this together with version.json so open pages reload onto new code
 const FB_PROJECT='bazaar-stall-order-queue',FB_KEY='AIzaSyBcNT7OHOW7-5iZ06bZJp31_BWazW-av4g';
 // Payment details shown when a customer picks GCash or Maya. Edit these, then upload your QR images
 // (qr-gcash.png and qr-maya.png) next to index.html.
@@ -79,6 +79,7 @@ let lastRelisten=0;
 const relisten=()=>{if(mode==='firebase'&&window.FB&&window.FB.auth.currentUser&&Date.now()-lastRelisten>1500){lastRelisten=Date.now();listen()}};
 // Safety net: if the live connection silently stalls (weak venue signal, phone woke up), re-read the
 // customer's own order directly from the server. One small read every 15s, only while their order is active.
+const rankOf=s=>s==='void'?99:STEPS.findIndex(x=>x[0]===s);
 const lcText=()=>S.lcErr?'Backup check failing ('+S.lcErr+'). Tap Refresh status.':S.lc?'Auto-updating · last checked '+new Date(S.lc).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'Auto-updating';
 function stamp(){S.lc=Date.now();const e=document.getElementById('lc');if(e)e.textContent=lcText()}
 // Backup that does NOT use the live connection: a plain web request for just this order's status.
@@ -94,7 +95,7 @@ async function pollRest(){
     const st=((await r.json()).fields||{}).status;
     const s=st&&st.stringValue;
     stamp();
-    if(s&&OWN&&OWN.id===id&&OWN.status!==s){OWN={...OWN,status:s};rebuild();pollOwn()}
+    if(s&&OWN&&OWN.id===id&&s!=='void'&&rankOf(s)>rankOf(OWN.status)){OWN={...OWN,status:s};rebuild();pollOwn()}
   }catch(e){S.lcErr='no network';const el=document.getElementById('lc');if(el)el.textContent=lcText()}
 }
 async function pollOwn(){
@@ -104,7 +105,8 @@ async function pollOwn(){
   try{
     const s=await window.FB.getDoc(window.FB.doc(window.FB.db,'orders',id));
     stamp();
-    if(s.exists()){const d={...s.data(),id:s.id};if(!OWN||OWN.status!==d.status||OWN.paid!==d.paid||OWN.rating!==d.rating){OWN=d;rebuild()}}
+    if(s.exists()){const d={...s.data(),id:s.id};if(OWN&&OWN.id===d.id&&d.status!=='void'&&rankOf(d.status)<rankOf(OWN.status))d.status=OWN.status; // ignore a slower, older answer
+      if(!OWN||OWN.status!==d.status||OWN.paid!==d.paid||OWN.rating!==d.rating){OWN=d;rebuild()}}
   }catch(e){}
 }
 let tick=0;
@@ -359,11 +361,19 @@ function vAdmin(){
   <div class="sec"><h2>Reviews</h2></div>`+(rv.map(o=>`<div class="card"><b>${o.rating}★ · ${esc(o.name)}</b> <span class="sub">#${pad(o.n)}</span><div>${esc(o.comment||'')}</div></div>`).join('')||'<div class="card c sub">No reviews yet</div>');
 }
 
+let lastHTML='',lastRoute='';
+const normLC=h=>h.replace(/id="lc"([^>]*)>[^<]*</,'id="lc"$1><'); // ignore the ticking "last checked" time
 function render(){
   const r=route(),a=$('#app');setTitle();
-  a.innerHTML=r==='cart'?vCart():r==='order'?vOrder():r==='admin'?vAdmin():vMenu();
+  let html=r==='cart'?vCart():r==='order'?vOrder():r==='admin'?vAdmin():vMenu();
   const mm=mine();
-  if(r==='order'&&mm&&mm.status!=='done'&&mm.status!=='void')a.insertAdjacentHTML('beforeend',`<div class="stat ${mm.status==='ready'?'rdy':''}">${mm.status==='ready'?'🔔 YOUR ORDER IS READY':'🥤 WE’RE PREPARING YOUR ORDER'}</div>`);
+  if(r==='order'&&mm&&mm.status!=='done'&&mm.status!=='void')html+=`<div class="stat ${mm.status==='ready'?'rdy':''}">${mm.status==='ready'?'🔔 YOUR ORDER IS READY':'🥤 WE’RE PREPARING YOUR ORDER'}</div>`;
+  const n=normLC(html);
+  if(r===lastRoute&&n===lastHTML&&a.innerHTML)return; // several live feeds report the same change: draw it once
+  const y=window.scrollY,same=r===lastRoute;
+  lastHTML=n;lastRoute=r;
+  a.innerHTML=html;
+  if(same)window.scrollTo(0,y); // stay where the customer was scrolled to
 }
 addEventListener('hashchange',()=>{render();scrollTo(0,0)});
 (async()=>{
