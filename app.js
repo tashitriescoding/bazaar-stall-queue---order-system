@@ -1,6 +1,6 @@
 const BRAND={name:'Brew Bazaar',tag:'Matcha and hojicha, made to order',links:[['Instagram','https://instagram.com/'],['Facebook','https://facebook.com/'],['TikTok','https://tiktok.com/']]};
 const PIN='1234'; // change before opening day
-const APP_V=3; // bump this together with version.json so open pages reload onto new code
+const APP_V=4; // bump this together with version.json so open pages reload onto new code
 const FB_PROJECT='bazaar-stall-order-queue',FB_KEY='AIzaSyBcNT7OHOW7-5iZ06bZJp31_BWazW-av4g';
 // Payment details shown when a customer picks GCash or Maya. Edit these, then upload your QR images
 // (qr-gcash.png and qr-maya.png) next to index.html.
@@ -79,7 +79,7 @@ let lastRelisten=0;
 const relisten=()=>{if(mode==='firebase'&&window.FB&&window.FB.auth.currentUser&&Date.now()-lastRelisten>1500){lastRelisten=Date.now();listen()}};
 // Safety net: if the live connection silently stalls (weak venue signal, phone woke up), re-read the
 // customer's own order directly from the server. One small read every 15s, only while their order is active.
-const lcText=()=>S.lc?'Auto-updating · last checked '+new Date(S.lc).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'Auto-updating';
+const lcText=()=>S.lcErr?'Backup check failing ('+S.lcErr+'). Tap Refresh status.':S.lc?'Auto-updating · last checked '+new Date(S.lc).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'Auto-updating';
 function stamp(){S.lc=Date.now();const e=document.getElementById('lc');if(e)e.textContent=lcText()}
 // Backup that does NOT use the live connection: a plain web request for just this order's status.
 // Works on any phone/browser even when the live feed is frozen or blocked.
@@ -89,12 +89,13 @@ async function pollRest(){
   if(!id||S.admin||(m&&(m.status==='done'||m.status==='void')))return;
   try{
     const r=await fetch('https://firestore.googleapis.com/v1/projects/'+FB_PROJECT+'/databases/(default)/documents/queue/'+encodeURIComponent(id)+'?key='+FB_KEY,{cache:'no-store'});
-    if(!r.ok)return;
+    if(!r.ok){S.lcErr='code '+r.status;const e=document.getElementById('lc');if(e)e.textContent=lcText();return}
+    S.lcErr='';
     const st=((await r.json()).fields||{}).status;
     const s=st&&st.stringValue;
     stamp();
     if(s&&OWN&&OWN.id===id&&OWN.status!==s){OWN={...OWN,status:s};rebuild();pollOwn()}
-  }catch(e){}
+  }catch(e){S.lcErr='no network';const el=document.getElementById('lc');if(el)el.textContent=lcText()}
 }
 async function pollOwn(){
   if(mode!=='firebase'||!window.FB||!window.FB.getDoc||S.admin)return;
@@ -106,7 +107,8 @@ async function pollOwn(){
     if(s.exists()){const d={...s.data(),id:s.id};if(!OWN||OWN.status!==d.status||OWN.paid!==d.paid||OWN.rating!==d.rating){OWN=d;rebuild()}}
   }catch(e){}
 }
-setInterval(()=>{pollRest();pollOwn()},8000);
+let tick=0;
+(function loop(){tick++;pollRest();if(tick%3===0)pollOwn();setTimeout(loop,route()==='order'&&!document.hidden?4000:10000)})();
 // Keep the phone's screen on while an order is active, so the page keeps running and listening.
 let wl=null;
 async function keepAwake(){
